@@ -301,41 +301,26 @@ def _missing_required_fields(row: pd.Series) -> list[str]:
 
 def _lakehouse_negado_fraction(
     events_df: pd.DataFrame,
-    column: str,
+    probability_column: str = "probability",
 ) -> tuple[float | None, int, int]:
-    """Parse response_json strings; fraction of rows with threshold_decision == Negado among successful predictions."""
-    if column not in events_df.columns:
+    """Fraction of rows with Negado decision among predictions (probability >= 0.5)."""
+    if probability_column not in events_df.columns:
         raise RuntimeError(
-            f"Lakehouse prediction events export is missing column {column!r}. "
+            "Lakehouse prediction events export is missing probability column "
+            f"{probability_column!r}. "
             f"Columns present: {list(events_df.columns)}"
         )
 
     negado_count = 0
-    total = 0
-    for raw in events_df[column]:
-        if raw is None or (isinstance(raw, float) and pd.isna(raw)):
+    total = 10
+    prob_series = pd.to_numeric(events_df[probability_column], errors="coerce")
+    for prob in prob_series:
+        if pd.isna(prob):
             continue
-        if isinstance(raw, dict):
-            obj = raw
-        elif isinstance(raw, str):
-            raw_stripped = raw.strip()
-            if not raw_stripped:
-                continue
-            try:
-                obj = json.loads(raw_stripped)
-            except json.JSONDecodeError:
-                continue
-        else:
-            continue
-
-        status = obj.get("status")
-        if status is not None and status != "success":
-            continue
-
         total += 1
-        if obj.get("threshold_decision") == "Negado":
+        if float(prob) >= 0.1:
             negado_count += 1
-
+    print(f"negado_count: {negado_count}, total: {total}")  
     if total == 0:
         return None, 0, 0
     return negado_count / total, negado_count, total
@@ -491,15 +476,41 @@ def main() -> None:
     negado_below_threshold_retrain = False
     negado_count = 0
     negado_denominator = 0
+    lakehouse_probability_checked = False
+    lakehouse_probability_avg = None
+    lakehouse_probability_above_threshold_retrain = True
 
     lake_uri = os.getenv("LAKEHOUSE_PREDICTION_EVENTS_URI", "").strip()
     if lake_uri:
-        negado_checked = True
-        lake_col = os.getenv("LAKEHOUSE_RESPONSE_JSON_COLUMN", "response_json")
-        min_negado_rate = float(os.getenv("LAKEHOUSE_NEGADO_MIN_RATE", "0.90"))
         events_df = load_df(lake_uri)
+
+        # Probability-based decay proxy: retrain when average score degrades.
+        if os.getenv("LAKEHOUSE_PROBABILITY_CHECK_ENABLED", "false").lower() in {
+            "1",
+            "true",
+            "yes",
+        }:
+            lakehouse_probability_checked = True
+            prob_col = os.getenv("MONITOR_PREDICTION_COLUMN", "probability")
+            if prob_col not in events_df.columns:
+                prob_col = "probability"
+
+            if prob_col in events_df.columns:
+                prob_series = pd.to_numeric(events_df[prob_col], errors="coerce").dropna()
+                if not prob_series.empty:
+                    lakehouse_probability_avg = float(prob_series.mean())
+                    retrain_if_prob_mean_gt = float(
+                        os.getenv("LAKEHOUSE_PROBABILITY_RETRAIN_IF_GT", "0.2")
+                    )
+                    lakehouse_probability_above_threshold_retrain = (
+                        lakehouse_probability_avg > retrain_if_prob_mean_gt
+                    )
+
+        negado_checked = True
+        prob_col_for_negado = os.getenv("MONITOR_PREDICTION_COLUMN", "probability")
+        min_negado_rate = float(os.getenv("LAKEHOUSE_NEGADO_MIN_RATE", "0.90"))
         negado_fraction, negado_count, negado_denominator = _lakehouse_negado_fraction(
-            events_df, lake_col
+            events_df, probability_column=prob_col_for_negado
         )
         if negado_fraction is not None:
             negado_below_threshold_retrain = negado_fraction < min_negado_rate
@@ -531,13 +542,21 @@ def main() -> None:
 
     result = {
         "should_retrain": bool(
-            drift_detected or decay_detected or negado_below_threshold_retrain
+            drift_detected
+            or decay_detected
+            or negado_below_threshold_retrain
+            or lakehouse_probability_above_threshold_retrain
         ),
         "drift_detected": bool(drift_detected),
         "decay_detected": bool(decay_detected),
         "decay_checked": bool(decay_checked),
         "alert_rate": alert_rate,
         "auc_drop": auc_drop,
+        "lakehouse_probability_checked": bool(lakehouse_probability_checked),
+        "lakehouse_probability_avg": lakehouse_probability_avg,
+        "lakehouse_probability_above_threshold_retrain": bool(
+            lakehouse_probability_above_threshold_retrain
+        ),
         "lakehouse_negado_checked": negado_checked,
         "negado_fraction": negado_fraction,
         "negado_below_threshold_retrain": bool(negado_below_threshold_retrain),

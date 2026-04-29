@@ -70,7 +70,10 @@ def credit_model_training_and_nannyml_monitoring():
 
     trigger_retrain_on_decay_or_drift = TriggerDagRunOperator(
         task_id="trigger_retrain_on_decay_or_drift",
-        trigger_dag_id="credit_model_retrain_dag",
+        trigger_dag_id=os.getenv(
+            "RETRAIN_DAG_ID",
+            "credit_model_retrain_from_github_actions",
+        ),
         wait_for_completion=False,
     )
 
