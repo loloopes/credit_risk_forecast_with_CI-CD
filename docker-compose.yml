@@ -20,8 +20,10 @@ services:
       MINIO_ROOT_USER: ${MINIO_ROOT_USER}
       MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
     ports:
-      - "9000:9000"   # S3 API
-      - "9001:9001"   # Console UI
+      # Host port defaults to 19000 — localhost:9000 is often ClickHouse native or other non-HTTP tools (BadStatusLine).
+      # Override: MINIO_API_HOST_PORT=9000 docker compose up
+      - "${MINIO_API_HOST_PORT:-19000}:9000"
+      - "${MINIO_CONSOLE_HOST_PORT:-9001}:9001"
     volumes:
       - ./minio_data:/data
     networks:
@@ -47,6 +49,7 @@ services:
   mlflow:
     image: python:3.11-slim
     container_name: mlflow_server
+    working_dir: /mlflow_data
     depends_on:
       - postgres
       - minio
@@ -57,20 +60,29 @@ services:
       AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
       AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
       MLFLOW_S3_ENDPOINT_URL: ${MLFLOW_S3_ENDPOINT_URL}
+      # Required for --app-name basic-auth (CSRF / session signing). Override in .env for production.
+      MLFLOW_FLASK_SERVER_SECRET_KEY: ${MLFLOW_FLASK_SERVER_SECRET_KEY:-change-me-set-a-long-random-secret-in-env}
+      # Same credentials the MLflow client uses (browser UI login + API basic auth).
+      MLFLOW_TRACKING_USERNAME: ${MLFLOW_TRACKING_USERNAME:-admin}
+      MLFLOW_TRACKING_PASSWORD: ${MLFLOW_TRACKING_PASSWORD:-password1234}
+    volumes:
+      # Persists basic_auth.db (users/permissions) across container recreates.
+      - mlflow_auth_data:/mlflow_data
     healthcheck:
       test:
         [
           "CMD-SHELL",
-          "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:5000', timeout=5)\"",
+          "python -c \"import base64, os, urllib.request as rq; u=os.environ['MLFLOW_TRACKING_USERNAME']; p=os.environ['MLFLOW_TRACKING_PASSWORD']; t=base64.b64encode(f'{u}:{p}'.encode()).decode(); r=rq.Request('http://127.0.0.1:5000/', headers={'Authorization': f'Basic {t}'}); rq.urlopen(r, timeout=5)\"",
         ]
       interval: 10s
       timeout: 5s
       retries: 12
-      start_period: 30s
+      start_period: 45s
     command: >
       bash -c "
-      pip install mlflow psycopg2-binary boto3 &&
+      pip install 'mlflow[auth]' psycopg2-binary boto3 &&
       mlflow server
+      --app-name basic-auth
       --host 0.0.0.0
       --port 5000
       --allowed-hosts '${MLFLOW_SERVER_ALLOWED_HOSTS}'
@@ -94,6 +106,8 @@ services:
     environment:
       # Importante: Usamos os nomes dos serviços do Docker Compose como hosts
       MLFLOW_TRACKING_URI: ${MLFLOW_TRACKING_URI}
+      MLFLOW_TRACKING_USERNAME: ${MLFLOW_TRACKING_USERNAME:-admin}
+      MLFLOW_TRACKING_PASSWORD: ${MLFLOW_TRACKING_PASSWORD:-password1234}
       # Usa versão registrada existente no MLflow
       MLFLOW_MODEL_URI: ${MLFLOW_MODEL_URI}
       RUN_ID: ${RUN_ID}
@@ -168,3 +182,4 @@ networks:
 
 volumes:
   postgres_data:
+  mlflow_auth_data:

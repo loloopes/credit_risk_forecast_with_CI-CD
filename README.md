@@ -1,94 +1,114 @@
-# Credit Risk Project
+# Credit risk forecast
 
-* This repository contains a credit risk data science project. It follows a practical, business-oriented approach to building data solutions for credit intelligence and risk decision-making.
+End-to-end **credit scoring** and **MLOps** reference: train a **LightGBM** pipeline, track experiments in **MLflow**, serve predictions from a **FastAPI** service, stream scoring traffic through **Kafka**, and persist decision outcomes to a **lakehouse** path using **PySpark** against a shared **Hive Metastore** and **S3-compatible** object storage (**MinIO**). Orchestration for scheduled monitoring, conditional retraining, and CI-triggered training is handled by **Apache Airflow**.
 
-## Project Scope
+This folder is designed to sit beside the rest of the workspace so you can wire the same networks, catalogs, and agent tooling into one coherent analytics and ML story.
 
-* Build a realistic credit risk modeling workflow
-* Combine technical quality with business applicability
-* Demonstrate clear reasoning, structured problem-solving, and well-justified modeling choices
+---
 
+## What this repository contains
 
-## Data Assets
-* Inside the data/ directory, you will find:
+| Area | Role |
+|------|------|
+| [`prod/lgbm_prod.py`](prod/lgbm_prod.py) | Production API: loads a registered model from **MLflow**, `/predict` scoring, optional **Kafka** consumer, **Spark** batch writes for prediction logging. |
+| [`dags/`](dags/) | **Airflow** DAG definitions and callable pipelines (`pipelines/train_model.py`, drift / decay checks). |
+| [`docker-compose.yml`](docker-compose.yml) | Core stack: Postgres + **MLflow** (with auth), **MinIO**, scoring API, **Kafka**; attaches to external Docker networks shared with other projects. |
+| [`docker-compose.airflow.yml`](docker-compose.airflow.yml) | **Apache Airflow** 3.x (Celery executor): scheduler, workers, API server, and DAG volume mounts for training and **NannyML**-style monitoring. |
+| [`client/kafka_request_generator.py`](client/kafka_request_generator.py) | Helper to exercise the async scoring path. |
+| [`docker/nannyml-evaluator/`](docker/nannyml-evaluator/) | Containerized evaluation script used from Airflow’s **DockerOperator**. |
+| [`.github/workflows/ci-cd.yml`](.github/workflows/ci-cd.yml) | Tests on PRs; image publish; optional workflow dispatch to integrate with remote **Airflow**. |
 
-* Four datasets used in analysis and modeling dicionario_dados.csv with a complete description of all variables
+Training reads labeled tables (CSV/Parquet, including **S3** URIs backed by MinIO), fits a sklearn **Pipeline** with **LGBMClassifier**, logs metrics and registers the model in **MLflow**.
 
-* This project prioritizes:
+---
 
-* Clear problem framing
-* Coherent analytical structure
-* Well-justified decisions
-* Practical methods that deliver business value
-* The goal is not complexity for its own sake, but effective and explainable credit risk analytics.
+## Apache Airflow
 
-## Airflow + NannyML Pipeline
+**Airflow** is the control plane for **repeatable ML workflows**:
 
-This repository now includes a baseline training and monitoring pipeline:
+- **`credit_model_training_and_nannyml_monitoring`** — daily schedule: runs drift / model-decay monitoring (via **DockerOperator** + the NannyML evaluator image), branches on the result, and can **TriggerDagRun** the retrain DAG when retraining is warranted.
+- **`credit_model_retrain_from_github_actions`** — on-demand / **GitHub Actions**–friendly: runs `pipelines/train_model.py` with environment injected from `pipelines/mlflow_training_env.py` to register a new model in **MLflow**.
 
-- `dags/pipelines/train_model.py`: trains a LightGBM pipeline, logs metrics, and registers the model in MLflow.
-- `dags/pipelines/monitor_model_decay.py`: runs NannyML drift monitoring comparing reference vs analysis data.
-- `dags/model_training_monitoring_dag.py`: runs monitoring first and retrains only when drift is detected.
+Bring the Airflow stack up with `docker-compose.airflow.yml` (see that file for services: Postgres, Redis, scheduler, workers, API server, init). DAG code lives under [`dags/`](dags/). Workers receive MinIO credentials and data paths via environment variables so training and monitoring jobs read/write the same artifact layout as the main compose stack.
 
-Flow logic:
+---
 
-- Airflow runs NannyML monitoring first (via `DockerOperator` container).
-- If drift/decay is detected above `DRIFT_ALERT_THRESHOLD`, retraining is triggered automatically.
-- If no drift is detected, retraining is skipped.
-- Schedule is daily (`@daily`), so checks run every day.
+## How this aligns with the rest of the workspace
 
-Model decay check (optional but enabled when columns exist):
+The following sibling directories are **not** submodules of this repo; they are **companion stacks** you run and connect with Docker networks and environment variables.
 
-- Uses `MONITOR_TARGET_COLUMN` (default `target`) and `MONITOR_PREDICTION_COLUMN` (default `prediction_proba`).
-- Compares reference AUC vs analysis AUC.
-- Triggers retraining when `reference_auc - analysis_auc >= MODEL_DECAY_MIN_AUC_DROP`.
+### [`spark-cluster`](../spark-cluster)
 
-### Expected input files
+The Spark **master** and **worker** compose file joins external networks `minio_minio` and **`credit_risk_shared`**, matching [`docker-compose.yml`](docker-compose.yml) in this project. The scoring API defaults (`SPARK_MASTER_URL`, `SPARK_HIVE_METASTORE_URIS`, `SPARK_SQL_WAREHOUSE_DIR`) assume executors can reach **`spark-master`** and a **Hive Metastore** thrift endpoint, with warehouse data on **`s3a://`** backed by MinIO. Use this cluster when you want distributed writes and Spark UI visibility for prediction logging and ETL-sized jobs.
 
-Place files in MinIO (recommended) or local mounted directory:
+### [`trino`](../trino)
 
-- MinIO:
-  - `s3://mlflow/data/base_submissao.parquet`
-  - `s3://mlflow/data/base_cadastral.parquet`
-  - `s3://mlflow/data/historico_emprestimos.parquet`
-  - `s3://mlflow/data/historico_parcelas.parquet`
-- Local fallback:
-  - `dags/data/base_submissao.parquet`
-  - `dags/data/base_cadastral.parquet`
-  - `dags/data/historico_emprestimos.parquet`
-  - `dags/data/historico_parcelas.parquet`
+The **Trino** stack (query engine, **Hive Metastore**, **ClickHouse**, etc.) is another consumer of the same **MinIO**-backed lakehouse idea: federated SQL over Iceberg-style catalogs and companion stores. After this service writes **prediction events** and related tables through Spark, **Trino** is the natural place for **ad hoc SQL**, BI, and data quality checks on the same namespaces.
 
-By default, training builds a dataset from those raw sources using `id_cliente` and `id_contrato`.
-If you provide `TRAIN_DATA_PATH`, that file is used directly instead.
+### [`llm`](../llm)
 
-`TARGET_COLUMN` must exist in the final training dataset (from merged raw files or explicit train file).
+The **LLM Analytics Assistant** demonstrates **natural language → Trino SQL** (via LangChain and MCP), **RAG** over documents, and **LoRA** fine-tuning with **MLflow** tracking in notebooks. Conceptually:
 
-NannyML output report is written to:
+- **This project** owns **batch training**, **registry promotion**, **online scoring**, and **Airflow**-driven **monitoring / retrain** loops.
+- **`llm`** sits on the **analyst and agent** side: asking questions and generating read-only SQL against the warehouse **Trino** exposes—including tables populated or enriched by the credit-risk pipeline.
 
-- `s3://mlflow/artifacts/nannyml_drift_report.csv` (default)
+Shared themes: **MLflow** for experiment lineage, **MinIO**-compatible **S3** paths for artifacts and data, and **Trino** as the read path for structured truth.
 
-Notes on monitoring:
+### [`mcp`](../mcp)
 
-- Drift check runs every day from `REFERENCE_DATA_PATH` (old baseline) and `ANALYSIS_DATA_PATH` (actuals).
-- Default mode expects folder-style prefixes:
-  - old: `s3://mlflow/data` with files like `base_submissao.parquet`
-  - actuals: `s3://mlflow/actuals` with files like `base_submissao_new.parquet`
-- The DockerOperator container merges the four raw sources by `id_cliente`/`id_contrato` before running NannyML.
-- Analysis rows are scored by calling the prediction API (`PREDICTION_API_URL`) for each record.
-- DockerOperator runs with `NANNYML_DOCKER_NETWORK_MODE=container:credit_scoring_api` by default, so API calls use `http://localhost:8000/predict` inside that network namespace.
-- Model decay check requires actual targets + predictions (`MONITOR_TARGET_COLUMN`, `MONITOR_PREDICTION_COLUMN`).
-- If actuals are not available yet, decay check is skipped and drift-only logic is applied.
-- Build the NannyML evaluator image once before running the DAG:
-  - `docker build -t datarisk/nannyml-evaluator:latest -f docker/nannyml-evaluator/Dockerfile docker/nannyml-evaluator`
-- If your actuals schema is missing API-required fields, set fallback payload values with `API_PAYLOAD_DEFAULTS_JSON` in `.env`.
+The **`mcp`** folder hosts a **Model Context Protocol** server (**`trino_mcp.py`**) that exposes **Trino** as tools for IDEs and agents. That is the bridge between **conversational interfaces** (for example notebooks in **`llm`**) and **live warehouse metadata and SQL execution**. Point MCP clients at this server with the same **Trino** host and credentials you use for the **`trino`** compose stack so agents query the same catalogs this pipeline ultimately feeds.
 
-### Running with Airflow
+---
 
-1. Copy `env-sample` to `.env` and adjust values.
-2. Ensure Airflow installs extra python libs using `_PIP_ADDITIONAL_REQUIREMENTS`.
-3. Start Airflow with:
-   - `docker compose -f docker-compose.airflow.yml up -d`
-4. In Airflow UI, enable DAG:
-   - `credit_model_training_and_nannyml_monitoring`
-5. Optional manual run:
-   - `docker compose -f docker-compose.airflow.yml exec airflow-apiserver airflow dags trigger credit_model_training_and_nannyml_monitoring`
+## End-to-end picture
+
+```mermaid
+flowchart LR
+  subgraph airflow["Apache Airflow"]
+    DAG1["Monitoring DAG"]
+    DAG2["Retrain DAG"]
+    DAG1 --> DAG2
+  end
+
+  subgraph crf["credit_risk_forecast"]
+    MLF["MLflow + MinIO"]
+    API["FastAPI scoring"]
+    KF["Kafka"]
+    MLF --> API
+    KF --> API
+  end
+
+  subgraph spark["spark-cluster"]
+    SP["Spark workers"]
+  end
+
+  subgraph wh["trino + lakehouse"]
+    TR["Trino"]
+    HMS["Hive Metastore"]
+    TR --> HMS
+  end
+
+  subgraph agents["llm + mcp"]
+    MCP["Trino MCP"]
+    LLM["LLM / LangChain"]
+    LLM --> MCP
+    MCP --> TR
+  end
+
+  DAG1 --> MLF
+  DAG2 --> MLF
+  API --> SP
+  SP --> HMS
+  API --> MLF
+```
+
+---
+
+## Quick start pointers
+
+1. Ensure external Docker networks exist (names used in compose: **`minio_minio`**, **`credit_risk_shared`**) and that **MinIO** / **Hive Metastore** / **Spark** are reachable as configured in your `.env`.
+2. From this directory: `docker compose up` for **MLflow**, **API**, **Kafka**, and dependencies (see [`docker-compose.yml`](docker-compose.yml)).
+3. For **Airflow**: `docker compose -f docker-compose.airflow.yml up` after aligning environment variables with your MinIO and API endpoints (see comments and defaults in that file).
+4. Run tests locally: `python -m pytest` (see [`pytest.ini`](pytest.ini) and [`requirements-ci.txt`](requirements-ci.txt) as referenced in CI).
+
+For deeper notebook and MCP setup, follow [`../llm/README.md`](../llm/README.md). For the query engine and catalog layout, see [`../trino/README.md`](../trino/README.md).

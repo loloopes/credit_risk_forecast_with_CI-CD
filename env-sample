@@ -13,6 +13,14 @@ MLFLOW_S3_IGNORE_TLS=true
 AWS_DEFAULT_REGION=us-east-1
 
 MLFLOW_SERVER_ALLOWED_HOSTS=mlflow:5000,localhost:*,127.0.0.1:*
+
+# MLflow basic-auth: set a long random secret for production (e.g. openssl rand -hex 32).
+# If this variable is unset or omitted from .env, docker-compose uses a weak dev default.
+MLFLOW_FLASK_SERVER_SECRET_KEY=C4r0l1n42110!@
+# Default admin user is admin / password1234 until you change it in the UI or auth API.
+MLFLOW_TRACKING_USERNAME=admin
+MLFLOW_TRACKING_PASSWORD=password1234
+
 MLFLOW_TRACKING_URI=http://mlflow:5000
 MLFLOW_EXPERIMENT_NAME=credit_risk_training
 MLFLOW_REGISTERED_MODEL_NAME=credit_riks_forecast
