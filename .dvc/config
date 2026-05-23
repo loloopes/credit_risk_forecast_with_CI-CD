@@ -1,0 +1,4 @@
+[core]
+    remote = winermote
+['remote "winermote"']
+    url = s3://data/dvc

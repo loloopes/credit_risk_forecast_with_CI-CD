@@ -1,5 +1,7 @@
 .vscode
-data
+# Dataset files live in DVC; Git tracks only *.dvc pointers (see `dvc add data`)
+/data/**
+!/data/**/*.dvc
 .work-folder-info
 .vfsmeta
 .stubs
@@ -18,3 +20,4 @@ logs/
 __pycache__/
 *.py[cod]
 *.pyc
+/data

@@ -16,8 +16,10 @@ pyarrow==23.0.1
 fastapi==0.135.3
 httpx==0.28.1
 pydantic==2.13.0
-uvicorn==0.44.0
 cloudpickle==3.1.1
 pytest==9.0.3
 nannyml==0.13.0
 confluent-kafka==2.10.0
+uvicorn[standard]==0.34.0
+feast
+dvc_s3
