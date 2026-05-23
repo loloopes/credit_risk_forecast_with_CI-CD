@@ -16,6 +16,9 @@ def get_training_env() -> dict:
         "ID_CONTRATO_COLUMN": os.getenv("ID_CONTRATO_COLUMN", "id_contrato"),
         "TARGET_COLUMN": os.getenv("TARGET_COLUMN", "target"),
         "MLFLOW_TRACKING_URI": os.getenv("MLFLOW_TRACKING_URI", "http://mlflow:5000"),
+        # Required when MLflow runs with --app-name basic-auth (see docker-compose.yml).
+        "MLFLOW_TRACKING_USERNAME": os.getenv("MLFLOW_TRACKING_USERNAME", "admin"),
+        "MLFLOW_TRACKING_PASSWORD": os.getenv("MLFLOW_TRACKING_PASSWORD", "password1234"),
         "MLFLOW_EXPERIMENT_NAME": os.getenv("MLFLOW_EXPERIMENT_NAME", "credit_risk_training"),
         "MLFLOW_REGISTERED_MODEL_NAME": os.getenv(
             "MLFLOW_REGISTERED_MODEL_NAME", "credit_model_pipeline_v2"

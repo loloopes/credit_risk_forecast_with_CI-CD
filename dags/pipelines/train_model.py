@@ -365,11 +365,23 @@ def _resolve_target_column(df: pd.DataFrame) -> str:
     )
 
 
+def _ensure_mlflow_auth() -> None:
+    """MLflow basic-auth (--app-name basic-auth) needs credentials in the task env."""
+    if os.getenv("MLFLOW_TRACKING_USERNAME") and os.getenv("MLFLOW_TRACKING_PASSWORD"):
+        return
+    raise RuntimeError(
+        "MLflow tracking credentials are missing. Set MLFLOW_TRACKING_USERNAME and "
+        "MLFLOW_TRACKING_PASSWORD on Airflow workers (docker-compose.airflow.yml) and in "
+        "get_training_env() so train_model.py can authenticate."
+    )
+
+
 def main() -> None:
     dataset_uri = os.getenv("TRAIN_DATA_PATH", "").strip()
     experiment_name = os.getenv("MLFLOW_EXPERIMENT_NAME", "credit_risk_training")
     model_name = os.getenv("MLFLOW_REGISTERED_MODEL_NAME", "credit_model_pipeline_v2")
     mlflow_tracking_uri = os.getenv("MLFLOW_TRACKING_URI", "http://localhost:5000")
+    _ensure_mlflow_auth()
 
     df, source_used = _resolve_training_dataset()
     target_col = _resolve_target_column(df)

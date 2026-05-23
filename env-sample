@@ -107,3 +107,6 @@ MONITOR_PROGRESS_EVERY=500
 # Retrain if fewer than LAKEHOUSE_NEGADO_MIN_RATE of predictions are classed as Negado (probability >= 0.5).
 # LAKEHOUSE_PREDICTION_EVENTS_URI=s3://mlflow/artifacts/prediction_events_export.parquet
 # LAKEHOUSE_NEGADO_MIN_RATE=0.90
+
+# Airflow (docker-compose.airflow.yml): same MLFLOW_* and AWS_* as above so train_model.py can
+# reach MLflow (basic auth) and MinIO. Workers must resolve host "mlflow" (shared Docker network).
