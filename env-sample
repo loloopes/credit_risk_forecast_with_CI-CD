@@ -112,6 +112,13 @@ API_PAYLOAD_DEFAULTS_JSON={"status_contrato":"ativo","tipo_pagamento":"boleto","
 MONITOR_API_WORKERS=16
 MONITOR_PROGRESS_EVERY=500
 
+# Lakehouse prediction logging (Iceberg via Spark in credit_scoring_api)
+# prediction_events: metadata + flattened response + flattened request columns
+# prediction_requests: metadata + flattened request columns only (join on event_id)
+# PREDICTION_LOG_DATABASE=forecast
+# PREDICTION_LOG_TABLE=prediction_events
+# PREDICTION_LOG_REQUESTS_TABLE=prediction_requests
+
 # Optional: parquet/csv export of Iceberg prediction_events (must include probability column).
 # Retrain if fewer than LAKEHOUSE_NEGADO_MIN_RATE of predictions are classed as Negado (probability >= 0.5).
 # LAKEHOUSE_PREDICTION_EVENTS_URI=s3://mlflow/artifacts/prediction_events_export.parquet

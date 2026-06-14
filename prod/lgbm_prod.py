@@ -77,6 +77,9 @@ SPARK_EXTRA_CLASSPATH = os.getenv(
 )
 PREDICTION_LOG_DATABASE = os.getenv("PREDICTION_LOG_DATABASE", "forecast")
 PREDICTION_LOG_TABLE = os.getenv("PREDICTION_LOG_TABLE", "prediction_events")
+PREDICTION_LOG_REQUESTS_TABLE = os.getenv(
+    "PREDICTION_LOG_REQUESTS_TABLE", "prediction_requests"
+)
 ICEBERG_MAIN_CATALOG = os.getenv("ICEBERG_MAIN_CATALOG", "iceberg")
 ICEBERG_HMS_CATALOG = os.getenv("ICEBERG_HMS_CATALOG", "iceberg_hms")
 _prediction_queue: "Queue[dict]" = Queue(maxsize=max(PREDICTION_LOG_QUEUE_MAXSIZE, 1))
@@ -682,10 +685,12 @@ def _append_prediction_events_to_lakehouse(events: list[dict]) -> None:
 
     model_name = _empty_to_none(MLFLOW_MODEL_NAME) or ""
     model_stage = _empty_to_none(MLFLOW_MODEL_STAGE) or ""
-    rows = [
+    event_rows = [
         _build_prediction_event_row(event, model_name, model_stage) for event in events
     ]
-    column_names = _prediction_event_column_names()
+    request_rows = [
+        _build_prediction_request_row(event, model_name, model_stage) for event in events
+    ]
 
     global _prediction_hms_registered
     with _spark_lock:
@@ -693,40 +698,102 @@ def _append_prediction_events_to_lakehouse(events: list[dict]) -> None:
 
         spark = _ensure_spark_session_locked()
         _ensure_prediction_table_locked(spark)
-        table_name = f"{PREDICTION_LOG_DATABASE}.{PREDICTION_LOG_TABLE}"
-        # Write through Spark (Iceberg HMS catalog) to persist in lakehouse.
-        full_table_name = f"{ICEBERG_HMS_CATALOG}.{table_name}"
-        _ensure_prediction_table_columns_locked(spark, full_table_name)
-        event_df = spark.createDataFrame(rows)
-        event_df = event_df.select(*column_names)
-        if LAKEHOUSE_WRITE_REPARTITION > 0 and len(rows) > 1:
-            event_df = event_df.repartition(LAKEHOUSE_WRITE_REPARTITION)
-        writer = (
-            event_df.writeTo(full_table_name)
-            .tableProperty("format-version", "2")
-            .tableProperty("write.format.default", "parquet")
+        _append_rows_to_iceberg_table(
+            spark,
+            PREDICTION_LOG_TABLE,
+            event_rows,
+            _prediction_event_columns(),
+            AnalysisException,
         )
-        try:
-            writer.append()
-        except AnalysisException:
-            # Some HMS setups do not auto-create namespace via V2 writer path.
-            spark.sql(
-                f"CREATE DATABASE IF NOT EXISTS {ICEBERG_HMS_CATALOG}.{PREDICTION_LOG_DATABASE}"
-            )
-            spark.sql(
-                f"CREATE NAMESPACE IF NOT EXISTS {ICEBERG_HMS_CATALOG}.{PREDICTION_LOG_DATABASE}"
-            )
-            column_defs = ", ".join(
-                f"{name} {col_type}" for name, col_type in _prediction_event_columns()
-            )
-            spark.sql(
-                f"CREATE TABLE IF NOT EXISTS {full_table_name} ({column_defs}) USING iceberg"
-            )
-            writer.append()
+        _append_rows_to_iceberg_table(
+            spark,
+            PREDICTION_LOG_REQUESTS_TABLE,
+            request_rows,
+            _prediction_request_columns(),
+            AnalysisException,
+        )
 
-        # Already writing directly to HMS catalog; no manual register needed.
         if not _prediction_hms_registered:
             _prediction_hms_registered = True
+
+
+def _spark_struct_type_from_columns(columns: list[tuple[str, str]]):
+    from pyspark.sql.types import DoubleType, IntegerType, StringType, StructField, StructType
+
+    type_map = {
+        "STRING": StringType(),
+        "DOUBLE": DoubleType(),
+        "INT": IntegerType(),
+    }
+    return StructType(
+        [
+            StructField(name, type_map.get(col_type.upper(), StringType()), True)
+            for name, col_type in columns
+        ]
+    )
+
+
+def _coerce_row_for_spark(row: dict[str, Any], columns: list[tuple[str, str]]) -> tuple[Any, ...]:
+    values: list[Any] = []
+    for name, col_type in columns:
+        value = row.get(name)
+        if value is None:
+            values.append(None)
+            continue
+        if col_type == "DOUBLE":
+            values.append(float(value))
+        elif col_type == "INT":
+            values.append(int(value))
+        else:
+            values.append(str(value))
+    return tuple(values)
+
+
+def _append_rows_to_iceberg_table(
+    spark,
+    table: str,
+    rows: list[dict[str, Any]],
+    columns: list[tuple[str, str]],
+    analysis_exception: type[Exception],
+) -> None:
+    if not rows:
+        return
+
+    column_names = [name for name, _ in columns]
+    full_table_name = f"{ICEBERG_HMS_CATALOG}.{PREDICTION_LOG_DATABASE}.{table}"
+    _ensure_table_columns_locked(spark, full_table_name, columns)
+    schema = _spark_struct_type_from_columns(columns)
+    spark_rows = [_coerce_row_for_spark(row, columns) for row in rows]
+    event_df = spark.createDataFrame(spark_rows, schema=schema).select(*column_names)
+    if LAKEHOUSE_WRITE_REPARTITION > 0 and len(rows) > 1:
+        event_df = event_df.repartition(LAKEHOUSE_WRITE_REPARTITION)
+    writer = (
+        event_df.writeTo(full_table_name)
+        .tableProperty("format-version", "2")
+        .tableProperty("write.format.default", "parquet")
+    )
+    try:
+        writer.append()
+    except analysis_exception as append_error:
+        error_text = str(append_error)
+        if "INSERT_COLUMN_ARITY_MISMATCH" in error_text or "Cannot write to" in error_text:
+            print(
+                f"Iceberg append failed for {full_table_name}: {append_error}. "
+                "Recreating table and retrying.",
+                flush=True,
+            )
+            _recreate_iceberg_table_locked(spark, full_table_name, columns)
+            writer.append()
+            return
+
+        spark.sql(
+            f"CREATE DATABASE IF NOT EXISTS {ICEBERG_HMS_CATALOG}.{PREDICTION_LOG_DATABASE}"
+        )
+        spark.sql(
+            f"CREATE NAMESPACE IF NOT EXISTS {ICEBERG_HMS_CATALOG}.{PREDICTION_LOG_DATABASE}"
+        )
+        _create_iceberg_table_locked(spark, full_table_name, columns)
+        writer.append()
 
 
 def _enqueue_prediction_event(request_payload: dict, response_payload: dict, request_id: str) -> None:
@@ -883,6 +950,7 @@ def _spark_sql_type_for_field(annotation: Any) -> str:
 
 
 def _prediction_event_columns() -> list[tuple[str, str]]:
+    """Combined table: metadata + response + request fields."""
     columns = list(PREDICTION_METADATA_COLUMNS)
     columns.extend(PREDICTION_RESPONSE_COLUMNS)
     for name, field in CreditApplication.model_fields.items():
@@ -890,8 +958,12 @@ def _prediction_event_columns() -> list[tuple[str, str]]:
     return columns
 
 
-def _prediction_event_column_names() -> list[str]:
-    return [name for name, _ in _prediction_event_columns()]
+def _prediction_request_columns() -> list[tuple[str, str]]:
+    """Request-only table: metadata + CreditApplication fields."""
+    columns = list(PREDICTION_METADATA_COLUMNS)
+    for name, field in CreditApplication.model_fields.items():
+        columns.append((name, _spark_sql_type_for_field(field.annotation)))
+    return columns
 
 
 def _build_prediction_event_row(
@@ -912,16 +984,60 @@ def _build_prediction_event_row(
     return row
 
 
-def _ensure_prediction_table_columns_locked(spark, full_table_name: str) -> None:
-    for column_name, column_type in _prediction_event_columns():
-        try:
-            spark.sql(
-                f"ALTER TABLE {full_table_name} "
-                f"ADD COLUMN IF NOT EXISTS {column_name} {column_type}"
-            )
-        except Exception:
-            # Table may not exist yet; fallback CREATE TABLE path handles it.
-            pass
+def _build_prediction_request_row(
+    event: dict[str, Any], model_name: str, model_stage: str
+) -> dict[str, Any]:
+    request_payload = event.get("request_payload") or {}
+    row: dict[str, Any] = {
+        "event_id": event["request_id"],
+        "event_ts": event["event_ts"],
+        "model_name": model_name,
+        "model_stage": model_stage,
+    }
+    for field_name in CreditApplication.model_fields:
+        row[field_name] = request_payload.get(field_name)
+    return row
+
+
+def _table_column_names_locked(spark, full_table_name: str) -> Optional[set[str]]:
+    try:
+        return {field.name for field in spark.table(full_table_name).schema.fields}
+    except Exception:
+        return None
+
+
+def _create_iceberg_table_locked(
+    spark, full_table_name: str, columns: list[tuple[str, str]]
+) -> None:
+    column_defs = ", ".join(f"{name} {col_type}" for name, col_type in columns)
+    spark.sql(
+        f"CREATE TABLE IF NOT EXISTS {full_table_name} ({column_defs}) USING iceberg"
+    )
+
+
+def _recreate_iceberg_table_locked(
+    spark, full_table_name: str, columns: list[tuple[str, str]]
+) -> None:
+    column_defs = ", ".join(f"{name} {col_type}" for name, col_type in columns)
+    spark.sql(f"DROP TABLE IF EXISTS {full_table_name}")
+    spark.sql(f"CREATE TABLE {full_table_name} ({column_defs}) USING iceberg")
+
+
+def _ensure_table_columns_locked(
+    spark, full_table_name: str, columns: list[tuple[str, str]]
+) -> None:
+    expected_columns = {name for name, _ in columns}
+    existing_columns = _table_column_names_locked(spark, full_table_name)
+    if existing_columns is None:
+        _create_iceberg_table_locked(spark, full_table_name, columns)
+        return
+    if existing_columns != expected_columns:
+        print(
+            f"Iceberg schema mismatch for {full_table_name}. "
+            f"Recreating table with {len(expected_columns)} columns.",
+            flush=True,
+        )
+        _recreate_iceberg_table_locked(spark, full_table_name, columns)
 
 
 DEFAULT_PREDICT_PAYLOAD: dict[str, Any] = {
