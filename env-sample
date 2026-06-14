@@ -19,9 +19,13 @@ MLFLOW_SERVER_ALLOWED_HOSTS=mlflow:5000,localhost:*,127.0.0.1:*
 # If this variable is unset or omitted from .env, docker-compose uses a weak dev default.
 MLFLOW_FLASK_SERVER_SECRET_KEY=C4r0l1n42110!@
 # Default admin user is admin / password1234 until you change it in the UI or auth API.
+# credit_scoring_api uses these for mlflow.sklearn.load_model (basic-auth server).
 MLFLOW_TRACKING_USERNAME=admin
 MLFLOW_TRACKING_PASSWORD=password1234
 
+# MLflow Docker image pins mlflow==3.13.0 — keep server and credit_api on the same major version.
+# If mlflow_server exits with "Can't locate revision", Postgres was migrated by a different
+# MLflow version; either match the version here or reset: docker compose down -v (deletes experiments).
 MLFLOW_TRACKING_URI=http://mlflow:5000
 MLFLOW_EXPERIMENT_NAME=credit_risk_training
 MLFLOW_REGISTERED_MODEL_NAME=credit_riks_forecast
@@ -39,8 +43,12 @@ MLFLOW_REGISTERED_MODEL_NAME=credit_riks_forecast
 # MLFLOW_PROMOTION_GATE_DISABLED=false
 
 # Priority 1 in lgbm_prod.py: explicit model URI(s). Comma-separated fallbacks are supported.
-# Your UI may show slightly different spellings depending on where you look; include both if unsure.
-MLFLOW_MODEL_URI=models:/credit_risk_forecast/1,models:/credit_riks_forecast/1
+# Use the registered model name from MLflow UI (e.g. credit_riks_forecast, not credit_risk).
+MLFLOW_MODEL_URI=models:/credit_riks_forecast/1
+
+# Background model load (default): API starts immediately; /health shows model_loading until ready.
+# MODEL_LOAD_BLOCKING=true blocks startup until MLflow download completes (old behavior).
+# MODEL_LOAD_TIMEOUT_SECONDS=300
 
 # Priority 2 in lgbm_prod.py: runs:/<RUN_ID>/<MLFLOW_MODEL_ARTIFACT_PATH>
 RUN_ID=1d9e5e1c73e94fa4ad66662d9e7c7b4b

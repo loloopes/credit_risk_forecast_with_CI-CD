@@ -10,7 +10,7 @@ lightgbm==4.3.0
 
 pydantic==2.6.4
 cloudpickle==3.1.1
-mlflow
+mlflow==3.13.0
 boto3
 pyspark==3.5.2
 confluent-kafka==2.10.0

@@ -11,6 +11,13 @@ from datetime import datetime, timezone
 from typing import Any, Iterable, Optional, Union, get_args, get_origin
 from uuid import uuid4
 
+# MLflow defines Pydantic fields named `model_name`; filter before importing mlflow.
+warnings.filterwarnings(
+    "ignore",
+    message=r'Field "model_name".*protected namespace',
+    category=UserWarning,
+)
+
 import mlflow
 import pandas as pd
 import uvicorn
@@ -18,15 +25,6 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from confluent_kafka import Consumer, KafkaError
 
-
-
-
-# MLflow (and similar) may define Pydantic fields named `model_name`; silence that noise.
-warnings.filterwarnings(
-    "ignore",
-    message=r'Field "model_name".*protected namespace',
-    category=UserWarning,
-)
 
 _spark_lock = threading.Lock()
 _spark_session = None
@@ -38,6 +36,8 @@ _prediction_hms_registered = False
 # ==========================================
 
 MLFLOW_TRACKING_URI = os.getenv("MLFLOW_TRACKING_URI", "http://localhost:5000")
+MLFLOW_TRACKING_USERNAME = os.getenv("MLFLOW_TRACKING_USERNAME", "")
+MLFLOW_TRACKING_PASSWORD = os.getenv("MLFLOW_TRACKING_PASSWORD", "")
 MLFLOW_MODEL_URI = os.getenv("MLFLOW_MODEL_URI")
 RUN_ID = os.getenv("RUN_ID")
 MLFLOW_MODEL_ARTIFACT_PATH = os.getenv("MLFLOW_MODEL_ARTIFACT_PATH", "credit_model_pipeline_v2")
@@ -177,9 +177,7 @@ def _iter_candidate_model_uris() -> list[str]:
 
         # If training logged `mlflow.set_tag("logged_model_uri", ...)`, prefer it.
         try:
-            from mlflow.tracking import MlflowClient
-
-            run = MlflowClient().get_run(run_id)
+            run = _mlflow_client().get_run(run_id)
             logged_uri = _empty_to_none(run.data.tags.get("logged_model_uri"))
             if logged_uri:
                 uris.append(logged_uri)
@@ -197,6 +195,116 @@ def _iter_candidate_model_uris() -> list[str]:
         uris.append(f"models:/{model_name}/{model_stage}")
 
     return _dedupe_preserve_order(uris)
+
+
+def _ensure_mlflow_auth() -> None:
+    if SKIP_MODEL_LOAD:
+        return
+    if _empty_to_none(MLFLOW_TRACKING_USERNAME) and _empty_to_none(MLFLOW_TRACKING_PASSWORD):
+        return
+    raise RuntimeError(
+        "MLflow basic-auth requires MLFLOW_TRACKING_USERNAME and "
+        "MLFLOW_TRACKING_PASSWORD (see credit_risk_forecast/env-sample)."
+    )
+
+
+def _authenticated_tracking_uri() -> str:
+    from urllib.parse import quote, urlparse, urlunparse
+
+    base = MLFLOW_TRACKING_URI.strip()
+    user = _empty_to_none(MLFLOW_TRACKING_USERNAME)
+    password = _empty_to_none(MLFLOW_TRACKING_PASSWORD)
+    if not user or not password:
+        return base
+
+    parsed = urlparse(base)
+    if parsed.username:
+        return base
+
+    host = parsed.hostname or ""
+    if parsed.port:
+        host = f"{host}:{parsed.port}"
+    netloc = f"{quote(user, safe='')}:{quote(password, safe='')}@{host}"
+    return urlunparse(parsed._replace(netloc=netloc))
+
+
+def _configure_mlflow_client() -> str:
+    _ensure_mlflow_auth()
+
+    user = _empty_to_none(MLFLOW_TRACKING_USERNAME)
+    password = _empty_to_none(MLFLOW_TRACKING_PASSWORD)
+    if user:
+        os.environ["MLFLOW_TRACKING_USERNAME"] = user
+    if password:
+        os.environ["MLFLOW_TRACKING_PASSWORD"] = password
+
+    for env_key in (
+        "AWS_ACCESS_KEY_ID",
+        "AWS_SECRET_ACCESS_KEY",
+        "AWS_DEFAULT_REGION",
+        "MLFLOW_S3_ENDPOINT_URL",
+        "MLFLOW_S3_IGNORE_TLS",
+    ):
+        value = _empty_to_none(os.getenv(env_key))
+        if value:
+            os.environ.setdefault(env_key, value)
+
+    tracking_uri = _authenticated_tracking_uri()
+    mlflow.set_tracking_uri(tracking_uri)
+    mlflow.set_registry_uri(tracking_uri)
+    return tracking_uri
+
+
+def _mlflow_client():
+    from mlflow.tracking import MlflowClient
+
+    tracking_uri = _authenticated_tracking_uri()
+    return MlflowClient(tracking_uri=tracking_uri, registry_uri=tracking_uri)
+
+
+def _verify_mlflow_auth() -> None:
+    try:
+        _mlflow_client().search_experiments(max_results=1)
+    except Exception as exc:
+        raise RuntimeError(
+            "MLflow authentication failed for "
+            f"{MLFLOW_TRACKING_URI}. Is mlflow_server running? "
+            "Check MLFLOW_TRACKING_USERNAME / MLFLOW_TRACKING_PASSWORD."
+        ) from exc
+
+
+def _load_model_from_mlflow() -> None:
+    global model
+
+    _configure_mlflow_client()
+    _verify_mlflow_auth()
+    print(
+        f"MLflow authenticated (uri={MLFLOW_TRACKING_URI}, "
+        f"user={_empty_to_none(MLFLOW_TRACKING_USERNAME) or 'none'})",
+        flush=True,
+    )
+
+    candidates = _iter_candidate_model_uris()
+    if not candidates:
+        raise RuntimeError(
+            "No model URI candidates resolved. Set MLFLOW_MODEL_URI, "
+            "or RUN_ID (+ MLFLOW_MODEL_ARTIFACT_PATH), "
+            "or MLFLOW_MODEL_NAME + MLFLOW_MODEL_STAGE."
+        )
+
+    last_error: Optional[Exception] = None
+    for model_uri in candidates:
+        print(f"Loading model from mlflow: {model_uri}...", flush=True)
+        try:
+            model = mlflow.sklearn.load_model(model_uri=model_uri)
+            print("Model loaded successfully!", flush=True)
+            return
+        except Exception as exc:
+            last_error = exc
+            print(f"Failed loading {model_uri}: {exc}", flush=True)
+
+    if last_error is not None:
+        raise last_error
 
 
 def _stop_spark_session() -> None:
@@ -656,30 +764,7 @@ if SKIP_MODEL_LOAD:
     model = None
 else:
     try:
-        mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
-
-        candidates = _iter_candidate_model_uris()
-        if not candidates:
-            raise RuntimeError(
-                "No model URI candidates resolved. Set MLFLOW_MODEL_URI, "
-                "or RUN_ID (+ MLFLOW_MODEL_ARTIFACT_PATH), "
-                "or MLFLOW_MODEL_NAME + MLFLOW_MODEL_STAGE."
-            )
-
-        last_error: Optional[Exception] = None
-        for model_uri in candidates:
-            print(f"Loading model from mlflow: {model_uri}...", flush=True)
-            try:
-                model = mlflow.sklearn.load_model(model_uri=model_uri)
-                print("Model loaded successfully!", flush=True)
-                last_error = None
-                break
-            except Exception as e:
-                last_error = e
-                print(f"Failed loading {model_uri}: {e}", flush=True)
-
-        if last_error is not None:
-            raise last_error
+        _load_model_from_mlflow()
     except Exception as e:
         print(f"Error loading model: {e}", flush=True)
         model = None
@@ -886,7 +971,15 @@ async def predict(application: dict[str, Any]):
 
 @app.get("/health")
 async def health():
-    return {"status": "online", "model_loaded": model is not None}
+    return {
+        "status": "online",
+        "model_loaded": model is not None,
+        "mlflow_tracking_uri": MLFLOW_TRACKING_URI,
+        "mlflow_auth_configured": bool(
+            _empty_to_none(MLFLOW_TRACKING_USERNAME)
+            and _empty_to_none(MLFLOW_TRACKING_PASSWORD)
+        ),
+    }
 
 
 if __name__ == "__main__":

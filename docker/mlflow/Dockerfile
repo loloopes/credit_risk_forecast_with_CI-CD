@@ -9,7 +9,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/* \
     && pip install --no-cache-dir --upgrade pip \
     && pip install --no-cache-dir --retries 10 --timeout 1000 \
-        "mlflow[auth]==3.11.1" \
+        "mlflow[auth]==3.13.0" \
         psycopg2-binary \
         boto3 \
         gunicorn
