@@ -163,6 +163,7 @@ def _dedupe_preserve_order(uris: Iterable[str]) -> list[str]:
 
 
 def _iter_candidate_model_uris() -> list[str]:
+    _configure_mlflow_client()
     uris: list[str] = []
 
     explicit = _empty_to_none(MLFLOW_MODEL_URI)
@@ -208,27 +209,8 @@ def _ensure_mlflow_auth() -> None:
     )
 
 
-def _authenticated_tracking_uri() -> str:
-    from urllib.parse import quote, urlparse, urlunparse
-
-    base = MLFLOW_TRACKING_URI.strip()
-    user = _empty_to_none(MLFLOW_TRACKING_USERNAME)
-    password = _empty_to_none(MLFLOW_TRACKING_PASSWORD)
-    if not user or not password:
-        return base
-
-    parsed = urlparse(base)
-    if parsed.username:
-        return base
-
-    host = parsed.hostname or ""
-    if parsed.port:
-        host = f"{host}:{parsed.port}"
-    netloc = f"{quote(user, safe='')}:{quote(password, safe='')}@{host}"
-    return urlunparse(parsed._replace(netloc=netloc))
-
-
 def _configure_mlflow_client() -> str:
+    """Configure MLflow basic-auth (env vars) and MinIO/S3 credentials for artifact download."""
     _ensure_mlflow_auth()
 
     user = _empty_to_none(MLFLOW_TRACKING_USERNAME)
@@ -249,7 +231,8 @@ def _configure_mlflow_client() -> str:
         if value:
             os.environ.setdefault(env_key, value)
 
-    tracking_uri = _authenticated_tracking_uri()
+    # Use plain URI; MLflow 3.x attaches HTTP Basic auth from MLFLOW_TRACKING_* env vars.
+    tracking_uri = MLFLOW_TRACKING_URI.strip()
     mlflow.set_tracking_uri(tracking_uri)
     mlflow.set_registry_uri(tracking_uri)
     return tracking_uri
@@ -258,8 +241,10 @@ def _configure_mlflow_client() -> str:
 def _mlflow_client():
     from mlflow.tracking import MlflowClient
 
-    tracking_uri = _authenticated_tracking_uri()
-    return MlflowClient(tracking_uri=tracking_uri, registry_uri=tracking_uri)
+    return MlflowClient(
+        tracking_uri=MLFLOW_TRACKING_URI.strip(),
+        registry_uri=MLFLOW_TRACKING_URI.strip(),
+    )
 
 
 def _verify_mlflow_auth() -> None:
@@ -273,8 +258,50 @@ def _verify_mlflow_auth() -> None:
         ) from exc
 
 
+def _parse_models_uri(model_uri: str) -> tuple[str, str]:
+    if not model_uri.startswith("models:/"):
+        raise ValueError(f"Not a models:/ URI: {model_uri}")
+    ref = model_uri[len("models:/") :]
+    if "@" in ref:
+        name, alias = ref.split("@", 1)
+        return name, f"@{alias}"
+    name, version = ref.split("/", 1)
+    return name, version
+
+
+def _get_model_version_for_uri(model_uri: str):
+    client = _mlflow_client()
+    name, version_or_stage = _parse_models_uri(model_uri)
+    if version_or_stage.startswith("@"):
+        return client.get_model_version_by_alias(name, version_or_stage[1:])
+    if version_or_stage.isdigit():
+        return client.get_model_version(name, version_or_stage)
+    matches = client.get_latest_versions(name, stages=[version_or_stage])
+    if matches:
+        return matches[0]
+    raise RuntimeError(
+        f"No model version found for {model_uri!r}. "
+        "Check the registered model name/version in MLflow UI."
+    )
+
+
+def _load_model_uri(model_uri: str):
+    """Load a model using authenticated MLflow client (registry + artifact download)."""
+    if model_uri.startswith("models:/"):
+        model_version = _get_model_version_for_uri(model_uri)
+        print(
+            f"Resolved {model_uri} -> source={model_version.source}",
+            flush=True,
+        )
+        artifact_path = mlflow.artifacts.download_artifacts(
+            artifact_uri=model_version.source
+        )
+        return mlflow.sklearn.load_model(artifact_path)
+    return mlflow.sklearn.load_model(model_uri)
+
+
 def _load_model_from_mlflow() -> None:
-    global model
+    global model, _model_load_error
 
     _configure_mlflow_client()
     _verify_mlflow_auth()
@@ -296,7 +323,8 @@ def _load_model_from_mlflow() -> None:
     for model_uri in candidates:
         print(f"Loading model from mlflow: {model_uri}...", flush=True)
         try:
-            model = mlflow.sklearn.load_model(model_uri=model_uri)
+            model = _load_model_uri(model_uri)
+            _model_load_error = None
             print("Model loaded successfully!", flush=True)
             return
         except Exception as exc:
@@ -407,7 +435,10 @@ def _predict_batch_from_payloads(
     sync_log: bool = False,
 ) -> list[dict[str, Any]]:
     if model is None:
-        raise HTTPException(status_code=500, detail="Modelo não carregado no servidor.")
+        detail = "Modelo não carregado no servidor."
+        if _model_load_error:
+            detail = f"Modelo não carregado: {_model_load_error}"
+        raise HTTPException(status_code=503, detail=detail)
     if not applications:
         return []
     if request_ids is None:
@@ -759,6 +790,8 @@ def _stop_prediction_log_worker() -> None:
     worker.join(timeout=5)
 
 
+_model_load_error: str | None = None
+
 if SKIP_MODEL_LOAD:
     print("SKIP_MODEL_LOAD enabled. Starting API without loading model.", flush=True)
     model = None
@@ -766,6 +799,7 @@ else:
     try:
         _load_model_from_mlflow()
     except Exception as e:
+        _model_load_error = str(e)
         print(f"Error loading model: {e}", flush=True)
         model = None
 
@@ -974,6 +1008,7 @@ async def health():
     return {
         "status": "online",
         "model_loaded": model is not None,
+        "model_load_error": _model_load_error,
         "mlflow_tracking_uri": MLFLOW_TRACKING_URI,
         "mlflow_auth_configured": bool(
             _empty_to_none(MLFLOW_TRACKING_USERNAME)
