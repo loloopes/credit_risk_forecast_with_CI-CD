@@ -8,7 +8,7 @@ import traceback
 import warnings
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
-from typing import Any, Iterable, Optional
+from typing import Any, Iterable, Optional, Union, get_args, get_origin
 from uuid import uuid4
 
 import mlflow
@@ -543,25 +543,10 @@ def _append_prediction_events_to_lakehouse(events: list[dict]) -> None:
 
     model_name = _empty_to_none(MLFLOW_MODEL_NAME) or ""
     model_stage = _empty_to_none(MLFLOW_MODEL_STAGE) or ""
-    rows = []
-    for event in events:
-        probability_value = event.get("response_payload", {}).get("probability")
-        try:
-            probability = float(probability_value) if probability_value is not None else None
-        except (TypeError, ValueError):
-            probability = None
-        rows.append(
-            {
-                "event_id": event["request_id"],
-                "event_ts": event["event_ts"],
-                "model_name": model_name,
-                "model_stage": model_stage,
-                "probability": probability,
-                "client_id": str(event.get("request_payload", {}).get("id_cliente", "")),
-                "request_json": json.dumps(event["request_payload"], ensure_ascii=False),
-                "response_json": json.dumps(event["response_payload"], ensure_ascii=False),
-            }
-        )
+    rows = [
+        _build_prediction_event_row(event, model_name, model_stage) for event in events
+    ]
+    column_names = _prediction_event_column_names()
 
     global _prediction_hms_registered
     with _spark_lock:
@@ -572,29 +557,9 @@ def _append_prediction_events_to_lakehouse(events: list[dict]) -> None:
         table_name = f"{PREDICTION_LOG_DATABASE}.{PREDICTION_LOG_TABLE}"
         # Write through Spark (Iceberg HMS catalog) to persist in lakehouse.
         full_table_name = f"{ICEBERG_HMS_CATALOG}.{table_name}"
-        try:
-            spark.sql(
-                f"ALTER TABLE {full_table_name} "
-                "ADD COLUMN IF NOT EXISTS probability DOUBLE"
-            )
-            spark.sql(
-                f"ALTER TABLE {full_table_name} "
-                "ADD COLUMN IF NOT EXISTS client_id STRING"
-            )
-        except Exception:
-            # Table may not exist yet; fallback CREATE TABLE path below handles it.
-            pass
+        _ensure_prediction_table_columns_locked(spark, full_table_name)
         event_df = spark.createDataFrame(rows)
-        event_df = event_df.select(
-            "event_id",
-            "event_ts",
-            "model_name",
-            "model_stage",
-            "client_id",
-            "probability",
-            "request_json",
-            "response_json",
-        )
+        event_df = event_df.select(*column_names)
         if LAKEHOUSE_WRITE_REPARTITION > 0 and len(rows) > 1:
             event_df = event_df.repartition(LAKEHOUSE_WRITE_REPARTITION)
         writer = (
@@ -612,17 +577,11 @@ def _append_prediction_events_to_lakehouse(events: list[dict]) -> None:
             spark.sql(
                 f"CREATE NAMESPACE IF NOT EXISTS {ICEBERG_HMS_CATALOG}.{PREDICTION_LOG_DATABASE}"
             )
+            column_defs = ", ".join(
+                f"{name} {col_type}" for name, col_type in _prediction_event_columns()
+            )
             spark.sql(
-                f"CREATE TABLE IF NOT EXISTS {full_table_name} ("
-                "event_id STRING, "
-                "event_ts STRING, "
-                "model_name STRING, "
-                "model_stage STRING, "
-                "client_id STRING, "
-                "probability DOUBLE, "
-                "request_json STRING, "
-                "response_json STRING"
-                ") USING iceberg"
+                f"CREATE TABLE IF NOT EXISTS {full_table_name} ({column_defs}) USING iceberg"
             )
             writer.append()
 
@@ -774,6 +733,76 @@ class CreditApplication(BaseModel):
     qtd_membros_familia: Optional[int] = None
     possui_carro: Optional[str] = None
     possui_imovel: Optional[str] = None
+
+
+PREDICTION_METADATA_COLUMNS: list[tuple[str, str]] = [
+    ("event_id", "STRING"),
+    ("event_ts", "STRING"),
+    ("model_name", "STRING"),
+    ("model_stage", "STRING"),
+]
+
+PREDICTION_RESPONSE_COLUMNS: list[tuple[str, str]] = [
+    ("request_id", "STRING"),
+    ("probability", "DOUBLE"),
+    ("threshold_decision", "STRING"),
+    ("status", "STRING"),
+]
+
+
+def _spark_sql_type_for_field(annotation: Any) -> str:
+    origin = get_origin(annotation)
+    if origin is Union:
+        non_none = [arg for arg in get_args(annotation) if arg is not type(None)]
+        if non_none:
+            annotation = non_none[0]
+    if annotation is float:
+        return "DOUBLE"
+    if annotation is int:
+        return "INT"
+    return "STRING"
+
+
+def _prediction_event_columns() -> list[tuple[str, str]]:
+    columns = list(PREDICTION_METADATA_COLUMNS)
+    columns.extend(PREDICTION_RESPONSE_COLUMNS)
+    for name, field in CreditApplication.model_fields.items():
+        columns.append((name, _spark_sql_type_for_field(field.annotation)))
+    return columns
+
+
+def _prediction_event_column_names() -> list[str]:
+    return [name for name, _ in _prediction_event_columns()]
+
+
+def _build_prediction_event_row(
+    event: dict[str, Any], model_name: str, model_stage: str
+) -> dict[str, Any]:
+    request_payload = event.get("request_payload") or {}
+    response_payload = event.get("response_payload") or {}
+    row: dict[str, Any] = {
+        "event_id": event["request_id"],
+        "event_ts": event["event_ts"],
+        "model_name": model_name,
+        "model_stage": model_stage,
+    }
+    for column_name, _ in PREDICTION_RESPONSE_COLUMNS:
+        row[column_name] = response_payload.get(column_name)
+    for field_name in CreditApplication.model_fields:
+        row[field_name] = request_payload.get(field_name)
+    return row
+
+
+def _ensure_prediction_table_columns_locked(spark, full_table_name: str) -> None:
+    for column_name, column_type in _prediction_event_columns():
+        try:
+            spark.sql(
+                f"ALTER TABLE {full_table_name} "
+                f"ADD COLUMN IF NOT EXISTS {column_name} {column_type}"
+            )
+        except Exception:
+            # Table may not exist yet; fallback CREATE TABLE path handles it.
+            pass
 
 
 DEFAULT_PREDICT_PAYLOAD: dict[str, Any] = {

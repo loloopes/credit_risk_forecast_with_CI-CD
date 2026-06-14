@@ -47,7 +47,9 @@ services:
       "
 
   mlflow:
-    image: python:3.11-slim
+    build:
+      context: ./docker/mlflow
+      dockerfile: Dockerfile
     container_name: mlflow_server
     working_dir: /mlflow_data
     depends_on:
@@ -77,16 +79,17 @@ services:
       interval: 10s
       timeout: 5s
       retries: 12
-      start_period: 45s
+      start_period: 30s
     command: >
       bash -c "
-      pip install 'mlflow[auth]' psycopg2-binary boto3 &&
-      mlflow server
+      mlflow db upgrade postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@${POSTGRES_HOST:-postgres}:5432/${POSTGRES_DB} &&
+      exec mlflow server
       --app-name basic-auth
       --host 0.0.0.0
       --port 5000
+      --gunicorn-opts '--workers 1 --timeout 120'
       --allowed-hosts '${MLFLOW_SERVER_ALLOWED_HOSTS}'
-      --backend-store-uri postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@${POSTGRES_HOST:-mlflow_postgres}:5432/${POSTGRES_DB}
+      --backend-store-uri postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@${POSTGRES_HOST:-postgres}:5432/${POSTGRES_DB}
       --default-artifact-root s3://${MLFLOW_BUCKET}
       "
 
@@ -126,7 +129,7 @@ services:
       PYSPARK_DRIVER_PYTHON: ${PYSPARK_DRIVER_PYTHON:-python3}
       PYSPARK_PYTHON: ${PYSPARK_PYTHON:-python3}
       PREDICTION_LOG_DATABASE: ${PREDICTION_LOG_DATABASE:-forecast}
-      PREDICTION_LOG_TABLE: ${PREDICTION_LOG_TABLE:-prediction_events}
+      PREDICTION_LOG_TABLE: ${PREDICTION_LOG_TABLE:-prediction_events_v1}
       PREDICTION_LOG_ENABLED: ${PREDICTION_LOG_ENABLED:-true}
       PREDICTION_LOG_STRICT: ${PREDICTION_LOG_STRICT:-true}
       KAFKA_CONSUMER_ENABLED: ${KAFKA_CONSUMER_ENABLED:-true}

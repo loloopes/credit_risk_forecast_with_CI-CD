@@ -52,7 +52,15 @@ WORKDIR /app
 # 4. Copia apenas o arquivo de dependências primeiro (otimiza o cache do Docker)
 # Se você tiver um requirements.txt, use-o. Caso contrário, instalaremos via RUN.
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+
+# PySpark is a ~317MB sdist; default pip read timeouts fail on slow links.
+ENV PIP_DEFAULT_TIMEOUT=1000 \
+    PIP_RETRIES=10
+
+RUN pip install --no-cache-dir --upgrade pip \
+    && pip install --no-cache-dir --retries 10 --timeout 1000 "pyspark==3.5.2" \
+    && grep -v '^pyspark' requirements.txt > /tmp/requirements-no-spark.txt \
+    && pip install --no-cache-dir --retries 10 --timeout 1000 -r /tmp/requirements-no-spark.txt
 
 # 5. Copia o restante do código da API
 # Certifique-se de que a classe CreditFeatureEngineering esteja no mesmo diretório ou em um arquivo importado

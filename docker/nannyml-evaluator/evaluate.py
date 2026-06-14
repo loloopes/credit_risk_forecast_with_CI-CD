@@ -533,7 +533,7 @@ def main() -> None:
                     {
                         "lakehouse_negado_check": True,
                         "warning": "no countable prediction rows "
-                        "(status success, valid response_json)",
+                        "(status success, valid probability)",
                         "lakehouse_uri": lake_uri,
                     }
                 ),
