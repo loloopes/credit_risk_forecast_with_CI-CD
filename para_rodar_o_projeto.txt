@@ -13,8 +13,8 @@
 body 
 
 {
-  "id_cliente": "12345",
-  "id_contrato": "98765",
+  "id_cliente": 12345,
+  "id_contrato": 98765,
   "tipo_contrato": "financiamento",
   "status_contrato": "ativo",
   "tipo_pagamento": "boleto",

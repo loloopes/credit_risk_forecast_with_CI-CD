@@ -35,13 +35,14 @@ services:
 
   create_bucket:
     image: minio/mc
+    restart: "no"
     depends_on:
       - minio
     entrypoint: >
       /bin/sh -c "
       sleep 5;
       mc alias set myminio http://minio:9000 ${MINIO_ROOT_USER} ${MINIO_ROOT_PASSWORD};
-      mc mb myminio/${MLFLOW_BUCKET};
+      mc mb --ignore-existing myminio/${MLFLOW_BUCKET};
       mc policy set public myminio/${MLFLOW_BUCKET};
       exit 0;
       "
@@ -53,9 +54,12 @@ services:
     container_name: mlflow_server
     working_dir: /mlflow_data
     depends_on:
-      - postgres
-      - minio
-      - create_bucket
+      postgres:
+        condition: service_started
+      minio:
+        condition: service_started
+      create_bucket:
+        condition: service_completed_successfully
     ports:
       - "5000:5000"
     environment:
@@ -163,6 +167,7 @@ services:
       KAFKA_PROCESS_ROLES: controller,broker
       KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
 
       KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,PLAINTEXT_HOST://0.0.0.0:29092,CONTROLLER://0.0.0.0:9093
       KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:29092

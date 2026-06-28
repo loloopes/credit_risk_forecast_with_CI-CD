@@ -1,7 +1,8 @@
 apache-airflow-providers-docker
+apache-airflow-providers-amazon
 mlflow
 lightgbm
-scikit-learn
+scikit-learn==1.8.0
 pandas
 pyarrow
 boto3

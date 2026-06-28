@@ -19,10 +19,49 @@ warnings.filterwarnings(
 )
 
 import mlflow
+import numpy as np
 import pandas as pd
+from sklearn.utils import validation as sklearn_validation
+
+
+def _patch_sklearn_validation() -> None:
+    """Map force_all_finite for MLflow models trained on sklearn < 1.8 (removed in 1.8)."""
+    if getattr(sklearn_validation, "_compat_force_all_finite_patch", False):
+        return
+
+    def _translate_finite_kwarg(kwargs: dict) -> None:
+        force = kwargs.pop("force_all_finite", None)
+        if force is not None and "ensure_all_finite" not in kwargs:
+            kwargs["ensure_all_finite"] = force
+
+    def _wrap_check_fn(original):
+        def wrapper(*args, **kwargs):
+            _translate_finite_kwarg(kwargs)
+            return original(*args, **kwargs)
+
+        return wrapper
+
+    for name in ("check_array", "check_X_y", "as_float_array", "check_pairwise_arrays"):
+        original = getattr(sklearn_validation, name, None)
+        if original is not None:
+            setattr(sklearn_validation, name, _wrap_check_fn(original))
+
+    validate_data = getattr(sklearn_validation, "validate_data", None)
+    if validate_data is not None:
+        setattr(sklearn_validation, "validate_data", _wrap_check_fn(validate_data))
+
+    sklearn_validation._compat_force_all_finite_patch = True
+
+
+_patch_sklearn_validation()
+
+import sklearn
 import uvicorn
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
+from sklearn.compose import ColumnTransformer
+from sklearn.impute import SimpleImputer
+from sklearn.pipeline import Pipeline
+from fastapi import Body, FastAPI, HTTPException
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 from confluent_kafka import Consumer, KafkaError
 
 
@@ -58,6 +97,8 @@ SPARK_HIVE_METASTORE_URIS = os.getenv(
 SPARK_SQL_WAREHOUSE_DIR = os.getenv("SPARK_SQL_WAREHOUSE_DIR", "s3a://lakehouse/")
 # Use container_name by default because this API and spark-cluster run in different compose projects.
 SPARK_DRIVER_HOST = os.getenv("SPARK_DRIVER_HOST", "credit-scoring-api")
+SPARK_DRIVER_PORT = os.getenv("SPARK_DRIVER_PORT", "")
+SPARK_BLOCK_MANAGER_PORT = os.getenv("SPARK_BLOCK_MANAGER_PORT", "")
 SPARK_S3A_ENDPOINT = os.getenv("SPARK_S3A_ENDPOINT", "http://minio:9000")
 SPARK_S3A_ACCESS_KEY = os.getenv(
     "SPARK_S3A_ACCESS_KEY", os.getenv("AWS_ACCESS_KEY_ID", "")
@@ -69,8 +110,12 @@ SPARK_PYTHON_BIN = os.getenv("PYSPARK_PYTHON", "python3")
 SPARK_DRIVER_PYTHON_BIN = os.getenv("PYSPARK_DRIVER_PYTHON", SPARK_PYTHON_BIN)
 SPARK_EXTRA_CLASSPATH = os.getenv(
     "SPARK_EXTRA_CLASSPATH",
+    "/opt/extra-jars/hadoop-common-3.3.4.jar:"
     "/opt/extra-jars/hadoop-aws-3.3.4.jar:"
     "/opt/extra-jars/aws-java-sdk-bundle-1.12.262.jar:"
+    "/opt/extra-jars/commons-configuration2-2.8.0.jar:"
+    "/opt/extra-jars/commons-lang3-3.12.0.jar:"
+    "/opt/extra-jars/commons-text-1.10.0.jar:"
     "/opt/extra-jars/woodstox-core-6.2.8.jar:"
     "/opt/extra-jars/stax2-api-4.2.1.jar:"
     "/opt/extra-jars/iceberg-spark-runtime-3.5_2.12-1.10.1.jar",
@@ -128,10 +173,22 @@ def _resolve_spark_driver_host(raw_host: str) -> str:
     """
     Spark Standalone rejects underscores in spark:// host URLs.
     Resolve invalid hostnames to a routable IP before building SparkSession.
+
+    In Kubernetes, SPARK_DRIVER_HOST must be the pod IP (not the Service DNS name):
+    the driver listens on a random RPC port that is not exposed through the Service.
     """
+    pod_ip = _empty_to_none(os.getenv("POD_IP"))
+    if pod_ip:
+        return pod_ip
+
     candidate = raw_host.strip()
     if not candidate:
         candidate = "127.0.0.1"
+    if candidate in {"credit-api", "credit-scoring-api"}:
+        try:
+            return socket.gethostbyname(candidate)
+        except Exception:
+            return "127.0.0.1"
     if "_" not in candidate:
         return candidate
     try:
@@ -288,6 +345,48 @@ def _get_model_version_for_uri(model_uri: str):
     )
 
 
+def _patch_sklearn_imputer(imputer: SimpleImputer) -> None:
+    """Backfill SimpleImputer attrs missing when sklearn train/inference versions differ."""
+    if hasattr(imputer, "_fill_dtype") and hasattr(imputer, "_fit_dtype"):
+        return
+    if hasattr(imputer, "_fit_dtype"):
+        imputer._fill_dtype = imputer._fit_dtype
+    elif hasattr(imputer, "_fill_dtype"):
+        imputer._fit_dtype = imputer._fill_dtype
+    elif hasattr(imputer, "statistics_"):
+        stats = getattr(imputer, "statistics_", None)
+        if stats is not None and len(stats) > 0:
+            dtype = np.asarray(stats).dtype
+        else:
+            dtype = np.dtype(np.float64)
+        imputer._fill_dtype = dtype
+        imputer._fit_dtype = dtype
+    else:
+        imputer._fill_dtype = np.dtype(np.float64)
+        imputer._fit_dtype = np.dtype(np.float64)
+
+
+def _patch_sklearn_imputers(estimator: Any) -> None:
+    if isinstance(estimator, SimpleImputer):
+        _patch_sklearn_imputer(estimator)
+        return
+    if isinstance(estimator, Pipeline):
+        for _, step in estimator.steps:
+            _patch_sklearn_imputers(step)
+        return
+    if isinstance(estimator, ColumnTransformer):
+        transformers = getattr(estimator, "transformers_", None) or estimator.transformers
+        for _, trans, _ in transformers:
+            _patch_sklearn_imputers(trans)
+
+
+def _predict_proba(input_df: pd.DataFrame) -> np.ndarray:
+    if model is None:
+        raise RuntimeError("model is not loaded")
+    _patch_sklearn_imputers(model)
+    return model.predict_proba(input_df)
+
+
 def _load_model_uri(model_uri: str):
     """Load a model using authenticated MLflow client (registry + artifact download)."""
     if model_uri.startswith("models:/"):
@@ -304,7 +403,7 @@ def _load_model_uri(model_uri: str):
 
 
 def _load_model_from_mlflow() -> None:
-    global model, _model_load_error
+    global model, _model_load_error, MODEL_INPUT_COLUMNS
 
     _configure_mlflow_client()
     _verify_mlflow_auth()
@@ -327,8 +426,13 @@ def _load_model_from_mlflow() -> None:
         print(f"Loading model from mlflow: {model_uri}...", flush=True)
         try:
             model = _load_model_uri(model_uri)
+            _patch_sklearn_imputers(model)
+            MODEL_INPUT_COLUMNS = _extract_model_input_columns(model)
             _model_load_error = None
-            print("Model loaded successfully!", flush=True)
+            print(
+                f"Model loaded successfully! Expecting {len(MODEL_INPUT_COLUMNS)} input columns.",
+                flush=True,
+            )
             return
         except Exception as exc:
             last_error = exc
@@ -363,11 +467,14 @@ def _ensure_spark_session_locked():
     extra_cp = SPARK_EXTRA_CLASSPATH.strip()
     spark_jars = ",".join([item for item in extra_cp.split(":") if item])
     driver_host = _resolve_spark_driver_host(SPARK_DRIVER_HOST)
+    print(
+        f"Starting SparkSession master={SPARK_MASTER_URL} driver_host={driver_host}",
+        flush=True,
+    )
     builder = (
         SparkSession.builder.appName("credit-scoring-api-lakehouse-log")
         .master(SPARK_MASTER_URL)
         .config("spark.submit.deployMode", "client")
-        .config("spark.driver.host", driver_host)
         .config("spark.driver.bindAddress", "0.0.0.0")
         .config("spark.sql.warehouse.dir", SPARK_SQL_WAREHOUSE_DIR)
         .config("spark.hadoop.hive.metastore.uris", SPARK_HIVE_METASTORE_URIS)
@@ -383,8 +490,13 @@ def _ensure_spark_session_locked():
         .config("spark.executor.memory", os.getenv("SPARK_EXECUTOR_MEMORY", "512m"))
         .config("spark.pyspark.python", SPARK_PYTHON_BIN)
         .config("spark.pyspark.driver.python", SPARK_DRIVER_PYTHON_BIN)
-        .config("spark.driver.userClassPathFirst", "true")
-        .config("spark.executor.userClassPathFirst", "true")
+        .config("spark.executorEnv.PYSPARK_PYTHON", SPARK_PYTHON_BIN)
+        .config("spark.executorEnv.PYSPARK_DRIVER_PYTHON", SPARK_DRIVER_PYTHON_BIN)
+        .config("spark.network.timeout", os.getenv("SPARK_NETWORK_TIMEOUT", "300s"))
+        .config(
+            "spark.executor.heartbeatInterval",
+            os.getenv("SPARK_EXECUTOR_HEARTBEAT_INTERVAL", "30s"),
+        )
         .config(
             "spark.sql.extensions",
             "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions",
@@ -402,12 +514,17 @@ def _ensure_spark_session_locked():
             "org.apache.hadoop.fs.s3a.SimpleAWSCredentialsProvider",
         )
     )
-    if extra_cp:
-        builder = (
-            builder.config("spark.driver.extraClassPath", extra_cp)
-            .config("spark.executor.extraClassPath", extra_cp)
-            .config("spark.jars", spark_jars)
-        )
+    if not SPARK_MASTER_URL.startswith("local"):
+        builder = builder.config("spark.driver.host", driver_host)
+    driver_port = _empty_to_none(SPARK_DRIVER_PORT)
+    if driver_port:
+        builder = builder.config("spark.driver.port", driver_port)
+    block_manager_port = _empty_to_none(SPARK_BLOCK_MANAGER_PORT)
+    if block_manager_port:
+        builder = builder.config("spark.driver.blockManager.port", block_manager_port)
+    # Load Iceberg/Hadoop deps once via spark.jars to avoid duplicate classloaders.
+    if spark_jars:
+        builder = builder.config("spark.jars", spark_jars)
     _spark_session = builder.getOrCreate()
     return _spark_session
 
@@ -430,6 +547,69 @@ def _predict_from_payload(
     return _predict_batch_from_payloads(
         [application], request_ids=[request_id], sync_log=sync_log
     )[0]
+
+
+def _extract_model_input_columns(sklearn_pipeline) -> list[str]:
+    preprocessor = sklearn_pipeline.named_steps["preprocessor"]
+    columns: list[str] = []
+    for _, _, column_selector in preprocessor.transformers_:
+        if hasattr(column_selector, "__iter__") and not isinstance(column_selector, str):
+            columns.extend(list(column_selector))
+    return columns
+
+
+MODEL_INPUT_COLUMNS: list[str] | None = None
+_NUMERIC_ID_COLUMNS = (
+    os.getenv("ID_CLIENTE_COLUMN", "id_cliente"),
+    os.getenv("ID_CONTRATO_COLUMN", "id_contrato"),
+)
+
+
+def _coerce_numeric_id_value(value: Any, *, default: int | None = 0) -> int | None:
+    if value is None or value == "":
+        return default
+    if isinstance(value, bool):
+        raise ValueError("id fields must be numeric, not boolean")
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float) and value.is_integer():
+        return int(value)
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            return default
+        try:
+            return int(stripped)
+        except ValueError as exc:
+            raise ValueError(
+                f"Numeric id expected (e.g. 27269498), got non-numeric string {value!r}"
+            ) from exc
+    raise ValueError(f"Numeric id expected, got {type(value).__name__}")
+
+
+def _coerce_numeric_id_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Training data stores ids as int64; coerce request values before median imputation."""
+    out = df.copy()
+    for column in _NUMERIC_ID_COLUMNS:
+        if column in out.columns:
+            out[column] = pd.to_numeric(out[column], errors="coerce")
+    return out
+
+
+def _build_model_input_df(payloads: list[dict[str, Any]]) -> pd.DataFrame:
+    rows: list[dict[str, Any]] = []
+    for payload in payloads:
+        row = dict(DEFAULT_PREDICT_PAYLOAD)
+        row.update(payload)
+        rows.append(row)
+
+    input_df = pd.DataFrame(rows)
+    if MODEL_INPUT_COLUMNS:
+        for column in MODEL_INPUT_COLUMNS:
+            if column not in input_df.columns:
+                input_df[column] = DEFAULT_PREDICT_PAYLOAD.get(column)
+        input_df = input_df[MODEL_INPUT_COLUMNS]
+    return _coerce_numeric_id_columns(input_df)
 
 
 def _predict_batch_from_payloads(
@@ -458,11 +638,11 @@ def _predict_batch_from_payloads(
         if not isinstance(application, dict):
             raise HTTPException(status_code=400, detail="Payload deve ser um objeto JSON.")
         normalized_application = _normalize_predict_payload(application)
-        request_payloads.append(normalized_application.model_dump())
+        request_payloads.append(normalized_application)
         resolved_request_ids.append(maybe_request_id or str(uuid4()))
 
-    input_df = pd.DataFrame(request_payloads)
-    probabilities = model.predict_proba(input_df)[:, 1]
+    input_df = _build_model_input_df(request_payloads)
+    probabilities = _predict_proba(input_df)[:, 1]
 
     responses: list[dict[str, Any]] = []
     events: list[dict[str, Any]] = []
@@ -534,6 +714,7 @@ def _kafka_consumer_worker() -> None:
     pending_request_ids: list[Optional[str]] = []
     flush_after_seconds = KAFKA_CONSUMER_BATCH_MAX_WAIT_MS / 1000.0
     next_flush_at = time.monotonic() + flush_after_seconds
+    next_topic_retry_at = 0.0
 
     def _flush_batch() -> None:
         nonlocal pending_msgs, pending_payloads, pending_request_ids, next_flush_at
@@ -592,9 +773,22 @@ def _kafka_consumer_worker() -> None:
                 if msg is None:
                     continue
                 if msg.error():
-                    if msg.error().code() == KafkaError._PARTITION_EOF:
+                    error = msg.error()
+                    if error.code() == KafkaError._PARTITION_EOF:
                         continue
-                    print(f"Kafka consume error: {msg.error()}", flush=True)
+                    if error.code() == KafkaError.UNKNOWN_TOPIC_OR_PART:
+                        now = time.monotonic()
+                        if now >= next_topic_retry_at:
+                            print(
+                                f"Kafka topic {KAFKA_CONSUMER_TOPIC!r} not ready ({error}). "
+                                "Waiting for topic creation...",
+                                flush=True,
+                            )
+                            next_topic_retry_at = now + 30.0
+                            consumer.unsubscribe()
+                            consumer.subscribe([KAFKA_CONSUMER_TOPIC])
+                        continue
+                    print(f"Kafka consume error: {error}", flush=True)
                     continue
                 try:
                     pending_payloads.append(_decode_kafka_payload(msg.value()))
@@ -874,10 +1068,86 @@ else:
 # Schema de entrada (payload bruto → DataFrame para o Pipeline)
 # ==========================================
 
+PREDICT_REQUEST_EXAMPLE: dict[str, Any] = {
+    "id_cliente": 27269498,
+    "id_contrato": 123456789,
+    "tipo_contrato": "Cash loans",
+    "status_contrato": "Approved",
+    "tipo_pagamento": "Cash through a bank",
+    "finalidade_emprestimo": "XAP",
+    "tipo_cliente": "Repeater",
+    "tipo_portfolio": "POS",
+    "tipo_produto": "XNA",
+    "categoria_bem": "Mobile",
+    "setor_vendedor": "Connectivity",
+    "canal_venda": "Country-wide",
+    "faixa_rendimento": "Middle",
+    "data_nascimento": "1990-05-15",
+    "data_decisao": "2023-10-01",
+    "data_solicitacao": "2023-09-28",
+    "valor_solicitado": 5000.0,
+    "valor_credito": 5500.0,
+    "valor_bem": 5000.0,
+    "valor_parcela": 250.0,
+    "valor_entrada": 0.0,
+    "percentual_entrada": 0.0,
+    "qtd_parcelas_planejadas": 24,
+    "taxa_juros_padrao": 0.05,
+    "taxa_juros_promocional": 0.04,
+    "hora_solicitacao": 14,
+    "flag_ultima_solicitacao_contrato": 1,
+    "flag_ultima_solicitacao_dia": 1,
+    "acompanhantes_cliente": 1,
+    "flag_seguro_contratado": 0,
+    "sexo": "M",
+    "qtd_filhos": 1,
+    "estado_civil": "Single / not married",
+    "nivel_educacao": "Higher education",
+    "ocupacao": "Core staff",
+    "tipo_renda": "Working",
+    "tipo_moradia": "House / apartment",
+    "tipo_organizacao": "Business Entity Type 3",
+    "nota_regiao_cliente": 2,
+    "nota_regiao_cliente_cidade": 2,
+    "renda_anual": 120000.0,
+    "qtd_membros_familia": 3,
+    "possui_carro": "Y",
+    "possui_imovel": "N",
+    "hora_solicitacao_submissao": 10,
+    "dia_semana_solicitacao_submissao": "MONDAY",
+    "tipo_contrato_submissao": "Cash loans",
+    "valor_bem_submissao": 5000.0,
+    "valor_credito_submissao": 5500.0,
+    "valor_parcela_submissao": 250.0,
+    "target_fpd": 0,
+    "target_ever30mob03": 0,
+}
+
 
 class CreditApplication(BaseModel):
-    id_cliente: str
-    id_contrato: Optional[str] = None
+    model_config = ConfigDict(
+        json_schema_extra={"examples": [PREDICT_REQUEST_EXAMPLE]},
+    )
+
+    id_cliente: int = Field(
+        0,
+        description="Numeric client identifier (same int64 style as the training parquet). Defaults to 0 if omitted.",
+    )
+    id_contrato: Optional[int] = Field(
+        None,
+        description="Numeric contract identifier (int or numeric string); omit or null to let the model impute.",
+    )
+
+    @field_validator("id_cliente", mode="before")
+    @classmethod
+    def validate_id_cliente(cls, value: Any) -> int:
+        coerced = _coerce_numeric_id_value(value, default=0)
+        return 0 if coerced is None else coerced
+
+    @field_validator("id_contrato", mode="before")
+    @classmethod
+    def validate_id_contrato(cls, value: Any) -> int | None:
+        return _coerce_numeric_id_value(value, default=None)
     tipo_contrato: str
     status_contrato: str
     tipo_pagamento: str
@@ -914,11 +1184,52 @@ class CreditApplication(BaseModel):
     acompanhantes_cliente: int
     flag_seguro_contratado: int
     motivo_recusa: Optional[str] = None
-    # Cadastral (merge com base_cadastral no treino — opcionais se não enviados)
+    # Cadastral (merge com base_cadastral no treino)
     renda_anual: Optional[float] = None
     qtd_membros_familia: Optional[int] = None
     possui_carro: Optional[str] = None
     possui_imovel: Optional[str] = None
+    sexo: Optional[str] = None
+    qtd_filhos: Optional[int] = None
+    estado_civil: Optional[str] = None
+    nivel_educacao: Optional[str] = None
+    ocupacao: Optional[str] = None
+    tipo_renda: Optional[str] = None
+    tipo_moradia: Optional[str] = None
+    tipo_organizacao: Optional[str] = None
+    nota_regiao_cliente: Optional[float] = None
+    nota_regiao_cliente_cidade: Optional[float] = None
+    # Submissão (merge com base_submissao no treino; sufixo _submissao quando colide)
+    data_solicitacao: Optional[str] = None
+    hora_solicitacao_submissao: Optional[int] = None
+    dia_semana_solicitacao_submissao: Optional[str] = None
+    tipo_contrato_submissao: Optional[str] = None
+    valor_bem_submissao: Optional[float] = None
+    valor_credito_submissao: Optional[float] = None
+    valor_parcela_submissao: Optional[float] = None
+    # Presentes no treino como features auxiliares; usar 0 em inferência
+    target_fpd: Optional[int] = 0
+    target_ever30mob03: Optional[int] = 0
+
+
+class PredictionResponse(BaseModel):
+    model_config = ConfigDict(
+        json_schema_extra={
+            "examples": [
+                {
+                    "request_id": "550e8400-e29b-41d4-a716-446655440000",
+                    "probability": 0.1245,
+                    "threshold_decision": "Aprovado",
+                    "status": "success",
+                }
+            ]
+        },
+    )
+
+    request_id: str
+    probability: float
+    threshold_decision: str
+    status: str
 
 
 PREDICTION_METADATA_COLUMNS: list[tuple[str, str]] = [
@@ -1041,7 +1352,7 @@ def _ensure_table_columns_locked(
 
 
 DEFAULT_PREDICT_PAYLOAD: dict[str, Any] = {
-    "id_cliente": "0",
+    "id_cliente": 0,
     "id_contrato": None,
     "tipo_contrato": "Cash loans",
     "status_contrato": "Approved",
@@ -1083,17 +1394,38 @@ DEFAULT_PREDICT_PAYLOAD: dict[str, Any] = {
     "qtd_membros_familia": None,
     "possui_carro": None,
     "possui_imovel": None,
+    "sexo": None,
+    "qtd_filhos": 0,
+    "estado_civil": None,
+    "nivel_educacao": None,
+    "ocupacao": None,
+    "tipo_renda": None,
+    "tipo_moradia": None,
+    "tipo_organizacao": None,
+    "nota_regiao_cliente": None,
+    "nota_regiao_cliente_cidade": None,
+    "data_solicitacao": None,
+    "hora_solicitacao_submissao": None,
+    "dia_semana_solicitacao_submissao": None,
+    "tipo_contrato_submissao": None,
+    "valor_bem_submissao": None,
+    "valor_credito_submissao": None,
+    "valor_parcela_submissao": None,
+    "target_fpd": 0,
+    "target_ever30mob03": 0,
 }
 
 
-def _normalize_predict_payload(payload: dict[str, Any]) -> CreditApplication:
+def _normalize_predict_payload(payload: dict[str, Any]) -> dict[str, Any]:
     merged = dict(DEFAULT_PREDICT_PAYLOAD)
     merged.update(payload)
-    if not merged.get("id_cliente"):
-        merged["id_cliente"] = "0"
+    if merged.get("id_cliente") is None:
+        merged["id_cliente"] = 0
     if not merged.get("data_decisao"):
         merged["data_decisao"] = datetime.now(timezone.utc).date().isoformat()
-    return CreditApplication.model_validate(merged)
+    # Validate known API fields; keep full merged dict for model input alignment.
+    CreditApplication.model_validate(merged)
+    return merged
 
 
 @asynccontextmanager
@@ -1106,13 +1438,44 @@ async def _lifespan(_app: FastAPI):
     _stop_spark_session()
 
 
-app = FastAPI(title="Datarisk Credit Scoring API", lifespan=_lifespan)
+app = FastAPI(
+    title="Datarisk Credit Scoring API",
+    version="1.1.0",
+    description=(
+        "Credit default scoring API backed by MLflow model `credit_model_pipeline_v2`. "
+        "Use **POST /predict** with a full application payload (loan + cadastral + submissão fields)."
+    ),
+    lifespan=_lifespan,
+)
 
 
-@app.post("/predict")
-async def predict(application: dict[str, Any]):
+@app.post(
+    "/predict",
+    summary="Score a credit application",
+    description=(
+        "Returns the estimated default probability and a decision:\n\n"
+        "- **Aprovado** — probability ≤ 0.30\n"
+        "- **Revisão Manual** — 0.30 < probability ≤ 0.50\n"
+        "- **Negado** — probability > 0.50\n\n"
+        "Open **Try it out** — pick example **full_application** or use the pre-filled body."
+    ),
+    response_model=PredictionResponse,
+)
+async def predict(
+    application: CreditApplication = Body(
+        ...,
+        openapi_examples={
+            "full_application": {
+                "summary": "Complete credit application",
+                "description": "Loan, cadastral, and submissão fields used by the trained model.",
+                "value": PREDICT_REQUEST_EXAMPLE,
+            },
+        },
+    ),
+) -> PredictionResponse:
     try:
-        return _predict_from_payload(application)
+        result = _predict_from_payload(application.model_dump(mode="json"))
+        return PredictionResponse.model_validate(result)
     except Exception as e:
         if isinstance(e, HTTPException):
             raise e
@@ -1124,6 +1487,7 @@ async def health():
     return {
         "status": "online",
         "model_loaded": model is not None,
+        "sklearn_version": sklearn.__version__,
         "model_load_error": _model_load_error,
         "mlflow_tracking_uri": MLFLOW_TRACKING_URI,
         "mlflow_auth_configured": bool(

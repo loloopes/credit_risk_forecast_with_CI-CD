@@ -13,6 +13,7 @@ import mlflow.sklearn
 from mlflow.tracking import MlflowClient
 import numpy as np
 import pandas as pd
+import sklearn
 from lightgbm import LGBMClassifier
 from sklearn.compose import ColumnTransformer
 from sklearn.impute import SimpleImputer
@@ -444,6 +445,7 @@ def main() -> None:
         )
         f1s = f1_score(y_valid, y_valid_pred, labels=labels, average=None, zero_division=0)
 
+        mlflow.log_param("sklearn_version", sklearn.__version__)
         mlflow.log_param("train_data_path", source_used if source_used else dataset_uri)
         mlflow.log_param("target_column", target_col)
         mlflow.log_param("n_features", X_train.shape[1])

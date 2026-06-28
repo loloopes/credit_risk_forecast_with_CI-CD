@@ -23,8 +23,8 @@ def api_module():
 @pytest.fixture()
 def valid_payload():
     return {
-        "id_cliente": "C001",
-        "id_contrato": "K001",
+        "id_cliente": 100001,
+        "id_contrato": 200001,
         "tipo_contrato": "Novo",
         "status_contrato": "Ativo",
         "tipo_pagamento": "Boleto",

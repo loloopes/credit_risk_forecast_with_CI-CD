@@ -51,8 +51,8 @@ def _random_payload(allowed_columns: set[str], idx: int) -> dict[str, Any]:
     decision_date = date.today() - timedelta(days=random.randint(0, 30))
     birth_date = date.today() - timedelta(days=random.randint(20 * 365, 70 * 365))
     payload: dict[str, Any] = {
-        "id_cliente": f"{100000 + idx}",
-        "id_contrato": str(uuid4()),
+        "id_cliente": 100000 + idx,
+        "id_contrato": 200000 + idx,
         "tipo_contrato": random.choice(["Cash loans", "Revolving loans"]),
         "status_contrato": random.choice(["Approved", "Refused", "Canceled"]),
         "tipo_pagamento": random.choice(

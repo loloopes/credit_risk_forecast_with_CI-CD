@@ -26,7 +26,18 @@ MLFLOW_TRACKING_PASSWORD=password1234
 # MLflow Docker image pins mlflow==3.13.0 — keep server and credit_api on the same major version.
 # If mlflow_server exits with "Can't locate revision", Postgres was migrated by a different
 # MLflow version; either match the version here or reset: docker compose down -v (deletes experiments).
-MLFLOW_TRACKING_URI=http://mlflow:5000
+
+# --- MLflow target ---
+# Local Docker stack (default):
+# MLFLOW_TRACKING_URI=http://mlflow:5000
+# MLFLOW_S3_ENDPOINT_URL=http://minio:9000
+#
+# AWS EKS — train from laptop (requires /etc/hosts: cd terraform && make setup-hosts):
+MLFLOW_TRACKING_URI=http://mlflow.local
+# MinIO S3 API (artifacts + training parquet): port-forward, then use localhost:9000
+#   kubectl -n data-platform port-forward svc/minio 9000:9000
+MLFLOW_S3_ENDPOINT_URL=http://localhost:9000
+# In-cluster (Airflow on EKS) uses http://mlflow:5000 and http://minio:9000 automatically.
 MLFLOW_EXPERIMENT_NAME=credit_risk_training
 MLFLOW_REGISTERED_MODEL_NAME=credit_riks_forecast
 
