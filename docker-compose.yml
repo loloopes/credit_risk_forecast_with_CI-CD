@@ -20,8 +20,7 @@ services:
       MINIO_ROOT_USER: ${MINIO_ROOT_USER}
       MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
     ports:
-      # Host port defaults to 19000 — localhost:9000 is often ClickHouse native or other non-HTTP tools (BadStatusLine).
-      # Override: MINIO_API_HOST_PORT=9000 docker compose up
+      # Host port defaults to 9000; if another service already binds :9000, set MINIO_API_HOST_PORT=19000.
       - "${MINIO_API_HOST_PORT:-9000}:9000"
       - "${MINIO_CONSOLE_HOST_PORT:-9001}:9001"
     volumes:
